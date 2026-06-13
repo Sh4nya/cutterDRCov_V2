@@ -1,32 +1,17 @@
 import traceback
 import cutter
 from . import drcov
+from .coverage_data import CoverageData
+from .ui_items import NumericTableItem, HexTableItem, FlowLayout
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QPushButton, QLabel, QFileDialog, QTextEdit,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QMessageBox, QCheckBox, QAbstractItemView
+    QMessageBox, QCheckBox, QAbstractItemView,
+    QApplication, QMenu, QSizePolicy,
 )
 from PySide6.QtGui import QAction, QColor
-
-
-class NumericTableItem(QTableWidgetItem):
-    """Сортировка по числовому значению (для % покрытия)"""
-    def __lt__(self, other):
-        try:
-            return float(self.text().rstrip('%')) < float(other.text().rstrip('%'))
-        except (ValueError, AttributeError):
-            return super().__lt__(other)
-
-
-class HexTableItem(QTableWidgetItem):
-    """Сортировка по hex-значению адреса"""
-    def __lt__(self, other):
-        try:
-            return int(self.text(), 16) < int(other.text(), 16)
-        except (ValueError, AttributeError):
-            return super().__lt__(other)
 
 
 class DRCovWidget(cutter.CutterDockWidget):
@@ -35,20 +20,17 @@ class DRCovWidget(cutter.CutterDockWidget):
         self.setObjectName("DRCovWidget")
         self.setWindowTitle("DynamoRIO Coverage")
 
-        self.normalized_coverage = {}   # {norm_addr: True}
-        self.modules = {}
-        self.pe_base = 0x140000000
-        self.drcov_base = 0
-        self.ignored_blocks = set()     # адреса блоков, исключённых из статистики
-        self._func_blocks_cache = {}    # {func_addr: [block_dict, ...]}
-        self._highlighted_addrs = set() # адреса подсвеченных блоков в CFG
+        self.coverage = CoverageData()
+        self.ignored_blocks: set[int] = set()
+        self._func_blocks_cache: dict[int, list] = {}
+        self._highlighted_addrs: set[int] = set()
+        self._narrow_mode = False   # текущий режим раскладки (True = узкий)
 
         self._init_ui()
         try:
             cutter.core().seekChanged.connect(self._on_seek_changed)
         except Exception:
             pass
-
 
     # UI
 
@@ -57,22 +39,24 @@ class DRCovWidget(cutter.CutterDockWidget):
         root_layout = QVBoxLayout()
         root_layout.setContentsMargins(4, 4, 4, 4)
 
-        # Верхняя панель
-        top_bar = QHBoxLayout()
-        self.load_btn = QPushButton("Load Coverage File")
-        self.load_btn.clicked.connect(self.load_coverage_file)
+        # Верхняя панель кнопок
+        top_bar = FlowLayout(spacing=4)
+        self.load_btn = QPushButton("Load Coverage File(s)")
+        self.load_btn.clicked.connect(self.load_coverage_files)
         self.status_label = QLabel("No coverage data loaded")
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.status_label.setMinimumWidth(0)
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self.clear_coverage)
         self.clear_btn.setEnabled(False)
-        self.highlight_btn = QPushButton("Подсветить покрытие в графе")
+        self.highlight_btn = QPushButton("Highlight Coverage")
         self.highlight_btn.clicked.connect(self._highlight_current_function)
         self.highlight_btn.setEnabled(False)
-        self.reset_highlight_btn = QPushButton("Сбросить подсветку графа")
+        self.reset_highlight_btn = QPushButton("Reset Highlight")
         self.reset_highlight_btn.clicked.connect(self._reset_graph_highlight)
         self.reset_highlight_btn.setEnabled(False)
         top_bar.addWidget(self.load_btn)
-        top_bar.addWidget(self.status_label, 1)
+        top_bar.addWidget(self.status_label)
         top_bar.addWidget(self.highlight_btn)
         top_bar.addWidget(self.reset_highlight_btn)
         top_bar.addWidget(self.clear_btn)
@@ -86,12 +70,12 @@ class DRCovWidget(cutter.CutterDockWidget):
         top_layout = QHBoxLayout()
         top_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Левая панель — функции
-        left_panel = QWidget()
+        # Левая панель — функции (сохраняем ссылку для адаптивной раскладки)
+        self.left_panel = QWidget()
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(0, 0, 2, 0)
 
-        func_header = QHBoxLayout()
+        func_header = FlowLayout(spacing=4)
         func_header.addWidget(QLabel("Functions"))
         self.hide_100_cb = QCheckBox("Hide 100% covered")
         self.hide_100_cb.stateChanged.connect(self._apply_hide_100)
@@ -108,15 +92,16 @@ class DRCovWidget(cutter.CutterDockWidget):
         self.func_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.func_table.itemSelectionChanged.connect(self._on_func_selected)
         self.func_table.itemDoubleClicked.connect(self._on_func_double_clicked)
+        self.func_table.setMinimumWidth(0)
         left_layout.addWidget(self.func_table)
-        left_panel.setLayout(left_layout)
+        self.left_panel.setLayout(left_layout)
 
         # Правая панель — базовые блоки
         right_panel = QWidget()
         right_layout = QVBoxLayout()
         right_layout.setContentsMargins(2, 0, 0, 0)
 
-        bb_header = QHBoxLayout()
+        bb_header = FlowLayout(spacing=4)
         self.bb_label = QLabel("Basic Blocks")
         bb_header.addWidget(self.bb_label)
         self.ignore_single_cb = QCheckBox("Ignore single-instr blocks")
@@ -125,7 +110,7 @@ class DRCovWidget(cutter.CutterDockWidget):
         right_layout.addLayout(bb_header)
 
         self.bb_table = QTableWidget(0, 4)
-        self.bb_table.setHorizontalHeaderLabels(["Address", "First Instruction", "Covered", "Ignore"])
+        self.bb_table.setHorizontalHeaderLabels(["Address", "Using Files", "Hits", "Ignore"])
         self.bb_table.setSortingEnabled(True)
         self.bb_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.bb_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -133,9 +118,12 @@ class DRCovWidget(cutter.CutterDockWidget):
         self.bb_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.bb_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.bb_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.bb_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.bb_table.customContextMenuRequested.connect(self._bb_context_menu)
+        self.bb_table.setMinimumWidth(0)
         right_layout.addWidget(self.bb_table)
 
-        bb_btns = QHBoxLayout()
+        bb_btns = FlowLayout(spacing=4)
         self.ignore_sel_btn = QPushButton("Ignore Selected")
         self.ignore_sel_btn.clicked.connect(self._ignore_selected_blocks)
         self.unignore_all_btn = QPushButton("Unignore All")
@@ -146,7 +134,7 @@ class DRCovWidget(cutter.CutterDockWidget):
         right_panel.setLayout(right_layout)
 
         top_splitter = QSplitter(Qt.Horizontal)
-        top_splitter.addWidget(left_panel)
+        top_splitter.addWidget(self.left_panel)
         top_splitter.addWidget(right_panel)
         top_splitter.setSizes([500, 500])
         top_layout.addWidget(top_splitter)
@@ -178,6 +166,19 @@ class DRCovWidget(cutter.CutterDockWidget):
         root.setLayout(root_layout)
         self.setWidget(root)
 
+        # Масштабируемость: разрешаем доку становиться узким
+        self.setMinimumWidth(120)
+        root.setMinimumWidth(0)
+
+    # Адаптивная раскладка
+
+    def resizeEvent(self, event):
+        """Скрывать панель Functions при ширине < 400 px."""
+        super().resizeEvent(event)
+        is_narrow = event.size().width() < 400
+        if is_narrow != self._narrow_mode:
+            self._narrow_mode = is_narrow
+            self.left_panel.setVisible(not is_narrow)
 
     # Лог
 
@@ -191,10 +192,9 @@ class DRCovWidget(cutter.CutterDockWidget):
         color = colors.get(level, "#aaaaaa")
         self.log_text.append(f'<span style="color:{color};">{msg}</span>')
 
-
     # Cutter API
 
-    def get_image_base(self):
+    def get_image_base(self) -> int:
         try:
             info = cutter.cmdj("ij")
             if info and 'bin' in info:
@@ -205,111 +205,89 @@ class DRCovWidget(cutter.CutterDockWidget):
             pass
         return 0x140000000
 
-    def is_address_covered(self, addr):
-        return addr in self.normalized_coverage and addr not in self.ignored_blocks
+    def is_address_covered(self, addr: int) -> bool:
+        return self.coverage.is_covered(addr) and addr not in self.ignored_blocks
 
+    # Загрузка файлов покрытия
 
-    # Загрузка файла покрытия
-
-    def load_coverage_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open drcov File", "",
+    def load_coverage_files(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open drcov File(s)", "",
             "drcov Files (*.log *.drcov);;All Files (*)"
         )
-        if not file_path:
+        if not file_paths:
             return
+        self._apply_coverage_from_files(file_paths)
+
+    def _apply_coverage_from_files(self, file_paths: list[str]):
+        """Загрузить несколько drcov-файлов и объединить покрытие."""
+        self.coverage.clear()
+        self._func_blocks_cache.clear()
+        self.ignored_blocks.clear()
+        self._highlighted_addrs.clear()
         try:
-            modules, bbs = drcov.load(file_path)
-        except drcov.DRCovVersionMisMatch:
-            QMessageBox.warning(self, "Unsupported",
-                "Only drcov v3 supported. Use DynamoRIO 10.x to generate traces.")
+            self._hl_clear(cutter.core().getBBHighlighter())
+        except Exception:
+            pass
+
+        pe_base = self.get_image_base()
+        self._log(f"Cutter image base: 0x{pe_base:x}")
+
+        load_errors: list[str] = []
+        for path in file_paths:
+            try:
+                modules, bbs = drcov.load(path)
+            except drcov.DRCovVersionMisMatch:
+                load_errors.append(f"{path}: только drcov v3 поддерживается (используйте DynamoRIO 10.x)")
+                continue
+            except Exception as e:
+                load_errors.append(f"{path}: {e}")
+                continue
+            new_blocks, main_name = self.coverage.add_file(path, modules, bbs, pe_base)
+            self._log(
+                f"[{self.coverage.total_files}/{len(file_paths)}] {path}: "
+                "ok"
+            )
+
+        if load_errors:
+            QMessageBox.warning(self, "Ошибки загрузки", "\n".join(load_errors))
+
+        if not self.coverage.total_covered:
+            self._log("Покрытых блоков не найдено", "warn")
+            self.status_label.setText("No covered blocks found")
             return
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"{e}\n\n{traceback.format_exc()}")
-            return
-        self._apply_coverage(modules, bbs)
 
-    def _apply_coverage(self, modules, bbs):
-        try:
-            self.normalized_coverage.clear()
-            self.modules.clear()
-            self._func_blocks_cache.clear()
-            self.ignored_blocks.clear()
-            self._highlighted_addrs.clear()
-
-            self.pe_base = self.get_image_base()
-            self._log(f"Cutter image base: 0x{self.pe_base:x}")
-
-            # Найти основной .exe модуль
-            main_module = None
-            for mod in modules:
-                if mod.get('name', '').lower().endswith('.exe'):
-                    main_module = mod
-                    self.drcov_base = mod.get('start', 0)
-                    self._log(f"Main module: {mod['name']} @ 0x{self.drcov_base:x}")
-                    break
-
-            if not main_module:
-                self._log("Warning: no .exe module found, using first module", "warn")
-                if modules:
-                    main_module = modules[0]
-                    self.drcov_base = main_module.get('start', 0)
-                else:
-                    self._log("No modules in coverage file", "error")
-                    return
-
-            main_name = main_module.get('name', '')
-
-            # Нормализуем адреса основного модуля
-            for i, (mod, bb_dict) in enumerate(zip(modules, bbs)):
-                base = mod.get('start', 0)
-                name = mod.get('name', f'mod_{i}')
-                self.modules[i] = {'name': name, 'base': base}
-
-                if name == main_name:
-                    for offset in bb_dict:
-                        abs_addr = base + offset
-                        rva = abs_addr - self.drcov_base
-                        norm_addr = self.pe_base + rva
-                        self.normalized_coverage[norm_addr] = True
-
-            if not self.normalized_coverage:
-                self._log("No covered blocks in main module", "warn")
-                self.status_label.setText("No covered blocks found")
+        if not self._check_compatibility():
+            answer = QMessageBox.question(
+                self, "Предупреждение совместимости",
+                "Адреса покрытия не совпадают с загруженным бинарником.\n"
+                "Возможно, файл .drcov получен для другой версии программы.\n\n"
+                "Продолжить загрузку?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if answer == QMessageBox.No:
+                self.coverage.clear()
+                self._log("Загрузка отменена: несовместимость адресов", "warn")
                 return
+            self._log("Продолжаем несмотря на несовместимость адресов", "warn")
 
-            # Проверка совместимости
-            if not self._check_compatibility():
-                answer = QMessageBox.question(
-                    self, "Compatibility Warning",
-                    "Coverage addresses don't match the loaded binary.\n"
-                    "The .drcov file may be from a different version of the executable.\n\n"
-                    "Load anyway?",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                if answer == QMessageBox.No:
-                    self._log("Load cancelled: compatibility check failed", "warn")
-                    return
-                self._log("Proceeding despite compatibility mismatch", "warn")
+        total_f = self.coverage.total_files
+        total_b = self.coverage.total_covered
+        self._log(f"Итого: {total_f} файл(а/ов), {total_b} покрытых блоков", "ok")
 
-            self._log(f"Loaded {len(self.normalized_coverage)} covered blocks", "ok")
+        self._color_cfg_blocks()
+        self._populate_function_coverage()
+        self.clear_btn.setEnabled(True)
+        self.highlight_btn.setEnabled(True)
+        self.reset_highlight_btn.setEnabled(True)
+        self.status_label.setText(
+            f"✓ {total_f} файл(а/ов)  ·  {total_b} покрытых блоков"
+        )
 
-            self._color_cfg_blocks()
-            self._populate_function_coverage()
-            self.clear_btn.setEnabled(True)
-            self.highlight_btn.setEnabled(True)
-            self.reset_highlight_btn.setEnabled(True)
-            self.status_label.setText(f"✓ {len(self.normalized_coverage)} covered blocks loaded")
+    # Проверка совместимости
 
-        except Exception as e:
-            QMessageBox.critical(self, "Error",
-                f"Failed to apply coverage: {e}\n\n{traceback.format_exc()}")
-
-
-    # Проверка совместимости файла покрытия с бинарником в Cutter
-
-    def _check_compatibility(self):
-        sample = list(self.normalized_coverage.keys())[:20]
+    def _check_compatibility(self) -> bool:
+        sample = list(self.coverage.hits.keys())[:20]
         if not sample:
             return True
         try:
@@ -325,7 +303,6 @@ class DRCovWidget(cutter.CutterDockWidget):
                             hits += 1
                             break
                 return hits >= 3
-            # Нет исполняемых секций — проверяем по диапазону функций
             funcs = cutter.cmdj("aflj") or []
             if not funcs:
                 return True
@@ -333,11 +310,24 @@ class DRCovWidget(cutter.CutterDockWidget):
             if not addrs:
                 return True
             lo, hi = min(addrs), max(addrs)
-            hits = sum(1 for a in sample if lo <= a <= hi + 0x10000)
-            return hits >= 3
+            return sum(1 for a in sample if lo <= a <= hi + 0x10000) >= 3
         except Exception:
-            return True  # не блокируем при ошибке API
+            return True
 
+    # Цветовая карта цветов
+
+    def _hit_color(self, addr: int) -> QColor:
+        pct = self.coverage.hit_pct(addr)
+        if pct == 0:
+            return QColor(180, 70, 70)       # Красный (0%)
+        elif pct >= 100:
+            return QColor(70, 255, 70)       # Зеленый (100%)
+        elif pct < 34:
+            return QColor(255, 255, 190)     # Светло-желтый (1% - 33%)
+        elif pct < 67:
+            return QColor(255, 230, 0)       # Насыщенный желтый (34% - 66%)
+        else:
+            return QColor(255, 170, 0)       # Темно-желтый / золотистый (67% - 99%)
 
     # Раскраска CFG блоков
 
@@ -353,12 +343,11 @@ class DRCovWidget(cutter.CutterDockWidget):
                     addr = block.get('addr', 0)
                     if not addr:
                         continue
-                    color = QColor("green") if addr in self.normalized_coverage else QColor("red")
+                    color = self._hit_color(addr)
                     hl.highlight(addr, color)
                     self._highlighted_addrs.add(addr)
         except Exception as e:
             self._log(f"CFG coloring failed: {e}", "warn")
-
 
     # Таблица функций
 
@@ -369,7 +358,7 @@ class DRCovWidget(cutter.CutterDockWidget):
 
         try:
             functions = cutter.cmdj("aflj") or []
-            self._log(f"Analysing {len(functions)} functions...")
+            self._log(f"Анализируем {len(functions)} функций...")
 
             covered_funcs = 0
             for func in functions:
@@ -407,26 +396,26 @@ class DRCovWidget(cutter.CutterDockWidget):
                 self.func_table.setItem(row, 2, pct_item)
 
             self.func_table.setSortingEnabled(True)
-            self._log(f"Done: {covered_funcs}/{len(functions)} functions with coverage", "ok")
+            self._log(f"Готово: {covered_funcs}/{len(functions)} функций с покрытием", "ok")
 
         except Exception as e:
             self._log(f"Function table error: {e}", "error")
             self._log(traceback.format_exc(), "error")
 
-    def _calc_coverage(self, blocks):
-        """Подсчёт покрытия с учётом ignored_blocks"""
+    def _calc_coverage(self, blocks: list[dict]) -> tuple[int, int]:
+        # Подсчёт покрытых/всего блоков с учётом ignored_blocks.
         total = covered = 0
         for block in blocks:
             addr = block.get('addr', 0)
             if addr in self.ignored_blocks:
                 continue
             total += 1
-            if addr in self.normalized_coverage:
+            if self.coverage.is_covered(addr):
                 covered += 1
         return total, covered
 
     def _refresh_function_coverage(self):
-        """Пересчитать проценты без полного перестроения таблицы"""
+        # Пересчитать проценты без полного перестроения таблицы.
         self.func_table.setSortingEnabled(False)
         for row in range(self.func_table.rowCount()):
             name_item = self.func_table.item(row, 0)
@@ -452,7 +441,6 @@ class DRCovWidget(cutter.CutterDockWidget):
 
         self.func_table.setSortingEnabled(True)
 
-
     # Фильтр "Скрыть 100% покрытых"
 
     def _apply_hide_100(self):
@@ -466,8 +454,7 @@ class DRCovWidget(cutter.CutterDockWidget):
                     val = 0.0
                 self.func_table.setRowHidden(row, hide and val >= 100.0)
 
-
-    # Выбор функции
+    # Выбор функции => таблица базовых блоков
 
     def _on_func_selected(self):
         row = self.func_table.currentRow()
@@ -481,7 +468,7 @@ class DRCovWidget(cutter.CutterDockWidget):
         self._populate_bb_table(func_addr, func_name)
 
     def _on_func_double_clicked(self, item):
-        """Двойной клик — переход к функции в дизассемблере (фича 2)"""
+        # Двойной клик — переход к функции в дизассемблере.
         row = item.row()
         name_item = self.func_table.item(row, 0)
         if not name_item:
@@ -495,10 +482,9 @@ class DRCovWidget(cutter.CutterDockWidget):
             except Exception as e:
                 self._log(f"Jump to 0x{func_addr:x} failed: {e}", "error")
 
+    # Таблица базовых блоков с тепловой картой
 
-    # Таблица базовых блоков + подсветка
-
-    def _populate_bb_table(self, func_addr, func_name):
+    def _populate_bb_table(self, func_addr: int, func_name: str):
         self.bb_label.setText(f"Basic Blocks: {func_name}")
         self.bb_table.setSortingEnabled(False)
         self.bb_table.setRowCount(0)
@@ -508,14 +494,17 @@ class DRCovWidget(cutter.CutterDockWidget):
             blocks = cutter.cmdj(f"afbj @ {func_addr}") or []
             self._func_blocks_cache[func_addr] = blocks
 
+        total_files = self.coverage.total_files
+
         for block in blocks:
             addr = block.get('addr', 0)
             if not addr:
                 continue
 
-            covered = addr in self.normalized_coverage
             ignored = addr in self.ignored_blocks
-            first_instr = self._get_first_instr(addr)
+            hit_count = self.coverage.hit_count(addr)
+            hit_pct = self.coverage.hit_pct(addr)
+            file_list = self.coverage.files_for_block(addr)
 
             row = self.bb_table.rowCount()
             self.bb_table.insertRow(row)
@@ -523,45 +512,68 @@ class DRCovWidget(cutter.CutterDockWidget):
             addr_item = HexTableItem(f"0x{addr:x}")
             addr_item.setData(Qt.UserRole, addr)
 
-            instr_item = QTableWidgetItem(first_instr)
+            # Столбец "Using Files" — имена файлов, покрывших блок
+            files_item = QTableWidgetItem(", ".join(file_list))
+            if file_list:
+                files_item.setToolTip("\n".join(file_list))
 
-            cov_item = QTableWidgetItem("Yes" if covered else "No")
+            hits_text = f"{hit_count}/{total_files}" if hit_count > 0 else "0"
+            hits_item = NumericTableItem(hits_text)
 
             ignore_item = QTableWidgetItem("✓" if ignored else "")
             ignore_item.setData(Qt.UserRole, addr)
             ignore_item.setTextAlignment(Qt.AlignCenter)
 
-            # Раскраска строки
             if ignored:
                 bg = QColor(55, 55, 55)
                 fg = QColor(120, 120, 120)
-            elif covered:
-                bg = QColor(0, 70, 0)
-                fg = QColor(180, 255, 180)
+            elif hit_count == 0:
+                bg = QColor(70, 20, 20)            # Темно-красный фон
+                fg = QColor(210, 100, 100)         # Светло-красный текст (0%)
+            elif hit_pct < 34:
+                bg = QColor(60, 60, 15)            # Темно-желтый фон
+                fg = QColor(255, 255, 190)         # Светло-желтый текст (1% - 33%)
+            elif hit_pct < 67:
+                bg = QColor(70, 65, 0)             # Темно-насыщенный желтый фон
+                fg = QColor(255, 230, 0)           # Насыщенный желтый текст (34% - 66%)
+            elif hit_pct < 100:
+                bg = QColor(80, 50, 0)             # Темно-золотистый/оранжевый фон
+                fg = QColor(255, 170, 0)           # Золотистый текст (67% - 99%)
             else:
-                bg = QColor(70, 0, 0)
-                fg = QColor(255, 180, 180)
-
-            for cell in [addr_item, instr_item, cov_item, ignore_item]:
+                bg = QColor(0, 60, 0)              # Темно-зеленый фон
+                fg = QColor(120, 255, 120)         # Светло-зеленый текст (100%)
+                
+                
+            for cell in [addr_item, files_item, hits_item, ignore_item]:
                 cell.setBackground(bg)
                 cell.setForeground(fg)
 
             self.bb_table.setItem(row, 0, addr_item)
-            self.bb_table.setItem(row, 1, instr_item)
-            self.bb_table.setItem(row, 2, cov_item)
+            self.bb_table.setItem(row, 1, files_item)
+            self.bb_table.setItem(row, 2, hits_item)
             self.bb_table.setItem(row, 3, ignore_item)
 
         self.bb_table.setSortingEnabled(True)
 
-    def _get_first_instr(self, addr):
-        try:
-            result = cutter.cmdj(f"pdj 1 @ {addr}")
-            if result:
-                return result[0].get('opcode', '???')
-        except Exception:
-            pass
-        return '???'
+    # Контекстное меню таблицы блоков — копировать адрес
 
+    def _bb_context_menu(self, pos):
+        row = self.bb_table.rowAt(pos.y())
+        if row < 0:
+            return
+        addr_item = self.bb_table.item(row, 0)
+        if not addr_item:
+            return
+        addr = addr_item.data(Qt.UserRole)
+        if not addr:
+            return
+
+        menu = QMenu(self)
+        copy_action = menu.addAction(f"Copy Address  (0x{addr:x})")
+        action = menu.exec(self.bb_table.viewport().mapToGlobal(pos))
+        if action == copy_action:
+            QApplication.clipboard().setText(f"0x{addr:x}")
+            self._log(f"Адрес 0x{addr:x} скопирован в буфер обмена", "ok")
 
     # Игнорирование блоков
 
@@ -575,7 +587,11 @@ class DRCovWidget(cutter.CutterDockWidget):
                 addr = item.data(Qt.UserRole)
                 if addr:
                     self.ignored_blocks.add(addr)
-        self._log(f"Ignored {len(selected_rows)} block(s). Total ignored: {len(self.ignored_blocks)}", "warn")
+        self._log(
+            f"Игнорировано {len(selected_rows)} блок(а/ов). "
+            f"Всего: {len(self.ignored_blocks)}",
+            "warn"
+        )
         self._after_ignore_change()
 
     def _unignore_all_blocks(self):
@@ -583,7 +599,7 @@ class DRCovWidget(cutter.CutterDockWidget):
         self.ignore_single_cb.blockSignals(True)
         self.ignore_single_cb.setChecked(False)
         self.ignore_single_cb.blockSignals(False)
-        self._log("All blocks unignored", "ok")
+        self._log("Все блоки разигнорированы", "ok")
         self._after_ignore_change()
 
     def _on_ignore_single_changed(self):
@@ -596,7 +612,7 @@ class DRCovWidget(cutter.CutterDockWidget):
                         if addr:
                             self.ignored_blocks.add(addr)
                             count += 1
-            self._log(f"Auto-ignored {count} single-instruction blocks", "warn")
+            self._log(f"Авто-игнор: {count} однострочных блоков", "warn")
         else:
             to_remove = set()
             for blocks in self._func_blocks_cache.values():
@@ -606,7 +622,7 @@ class DRCovWidget(cutter.CutterDockWidget):
                         if addr:
                             to_remove.add(addr)
             self.ignored_blocks -= to_remove
-            self._log(f"Unignored {len(to_remove)} single-instruction blocks", "ok")
+            self._log(f"Разигнорировано {len(to_remove)} однострочных блоков", "ok")
         self._after_ignore_change()
 
     def _after_ignore_change(self):
@@ -616,25 +632,28 @@ class DRCovWidget(cutter.CutterDockWidget):
             self._populate_bb_table(name_item.data(Qt.UserRole), name_item.text())
         self._refresh_function_coverage()
 
-
-    # callback
+    # Seek callback
 
     def _on_seek_changed(self):
         try:
             addr = cutter.core().getOffset()
-            if not self.normalized_coverage:
+            if not self.coverage.total_covered:
                 return
             if self.is_address_covered(addr):
-                self.status_label.setText(f"✓ 0x{addr:x} — covered")
+                hits = self.coverage.hit_count(addr)
+                pct = self.coverage.hit_pct(addr)
+                self.status_label.setText(
+                    f"✓ 0x{addr:x} — покрыт ({hits}/{self.coverage.total_files} файлов, {pct:.0f}%)"
+                )
             else:
-                self.status_label.setText(f"○ 0x{addr:x} — not covered")
+                self.status_label.setText(f"○ 0x{addr:x} — не покрыт")
         except Exception:
             pass
 
-    # Подсветка текущей функции в графе
+    # Подсветка функции в графе
 
     def _highlight_current_function(self):
-        """Красит блоки выбранной функции в CFG через getBBHighlighter"""
+        # Красит блоки выбранной функции в CFG через getBBHighlighter.
         func_addr = None
         row = self.func_table.currentRow()
         if row >= 0:
@@ -665,18 +684,21 @@ class DRCovWidget(cutter.CutterDockWidget):
                 addr = block.get('addr', 0)
                 if not addr:
                     continue
-                color = QColor("green") if addr in self.normalized_coverage else QColor("red")
+                color = self._hit_color(addr)
                 hl.highlight(addr, color)
                 self._highlighted_addrs.add(addr)
                 colored += 1
 
             self._log(f"Подсвечено {colored} блоков функции 0x{func_addr:x}", "ok")
 
+            # Переход к функции — граф откроется с уже применёнными цветами
+            cutter.core().seekAndShow(func_addr)
+
         except Exception as e:
             self._log(f"Ошибка подсветки: {e}", "error")
 
     def _reset_graph_highlight(self):
-        """Сбрасывает все цвета блоков в CFG"""
+        # Сбрасывает все цвета блоков в CFG.
         try:
             hl = cutter.core().getBBHighlighter()
             self._hl_clear(hl)
@@ -685,17 +707,15 @@ class DRCovWidget(cutter.CutterDockWidget):
             self._log(f"Ошибка сброса: {e}", "error")
 
     def _hl_clear(self, hl):
-        """clear(addr) для каждого подсвеченного блока — clear() без аргументов не существует"""
+        # Очистить подсветку всех отслеживаемых блоков.
         for addr in self._highlighted_addrs:
             hl.clear(addr)
         self._highlighted_addrs.clear()
 
-
-    # Очистка
+    # Очистка всех данных
 
     def clear_coverage(self):
-        self.normalized_coverage.clear()
-        self.modules.clear()
+        self.coverage.clear()
         self.ignored_blocks.clear()
         self._func_blocks_cache.clear()
         self.func_table.setRowCount(0)
@@ -712,14 +732,13 @@ class DRCovWidget(cutter.CutterDockWidget):
             self._hl_clear(cutter.core().getBBHighlighter())
         except Exception:
             pass
-        self._highlighted_addrs.clear()
 
 
 class DRCovPlugin(cutter.CutterPlugin):
     name = "DynamoRIO Coverage"
-    description = "Visualize DynamoRIO code coverage in Cutter"
-    version = "2.0"
-    author = "CutterDRcov"
+    description = "Visualize DynamoRIO code coverage in Cutter V2"
+    version = "2.2"
+    author = "Shanya"
 
     def setupPlugin(self):
         pass
